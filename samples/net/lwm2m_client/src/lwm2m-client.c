@@ -13,9 +13,17 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 
 #include <drivers/hwinfo.h>
 #include <zephyr.h>
+#include <dfu/mcuboot.h>
+#include <dfu/flash_img.h>
+#include <drivers/flash.h>
+#include <logging/log_ctrl.h>
+#include <power/reboot.h>
 #include <drivers/gpio.h>
 #include <drivers/sensor.h>
+#include <storage/flash_map.h>
 #include <net/lwm2m.h>
+#include <settings/settings.h>
+#include "settings.h"
 
 #define APP_BANNER "Run LWM2M client"
 
@@ -78,6 +86,15 @@ static uint32_t led_state;
 
 static struct lwm2m_ctx client;
 
+static struct k_delayed_work reboot_work;
+
+#define FLASH_BANK0_ID FLASH_AREA_ID(image_0)
+#define FLASH_BANK1_ID FLASH_AREA_ID(image_1)
+#define FLASH_BANK1_OFFSET FLASH_AREA_OFFSET(image_1)
+#define FLASH_BANK1_SIZE FLASH_AREA_SIZE(image_1)
+static const struct device *flash_dev;
+static struct flash_img_context dfu_ctx;
+
 #if defined(CONFIG_LWM2M_DTLS_SUPPORT)
 #define TLS_TAG			1
 
@@ -93,7 +110,8 @@ static const char client_psk_id[] = "Client_identity";
 static struct k_sem quit_lock;
 
 #if defined(CONFIG_LWM2M_FIRMWARE_UPDATE_OBJ_SUPPORT)
-static uint8_t firmware_buf[64];
+static uint8_t firmware_buf[CONFIG_LWM2M_COAP_BLOCK_SIZE];
+static char firmware_version[32];
 #endif
 
 /* TODO: Move to a pre write hook that can handle ret codes once available */
@@ -144,13 +162,28 @@ static int init_led_device(void)
 	return 0;
 }
 
+static void *firmware_read_cb(uint16_t obj_inst_id, uint16_t res_id,
+				uint16_t res_inst_id, size_t *data_len)
+{
+	*data_len = strlen(firmware_version);
+
+	return firmware_version;
+}
+
+static void reboot(struct k_work *work)
+{
+	LOG_INF("Rebooting device");
+#ifdef CONFIG_NET_L2_BT
+	bt_network_disable();
+#endif
+	LOG_PANIC();
+	sys_reboot(SYS_REBOOT_WARM);
+}
+
 static int device_reboot_cb(uint16_t obj_inst_id)
 {
-	LOG_INF("DEVICE: REBOOT");
-	/* Add an error for testing */
-	lwm2m_device_add_err(LWM2M_DEVICE_ERROR_LOW_POWER);
-	/* Change the battery voltage for testing */
-	lwm2m_engine_set_s32("3/0/7/0", (bat_mv - 1));
+	LOG_INF("DEVICE: Reboot in progress");
+	k_delayed_work_submit(&reboot_work, K_SECONDS(1));
 
 	return 0;
 }
@@ -169,16 +202,34 @@ static int device_factory_default_cb(uint16_t obj_inst_id)
 #if defined(CONFIG_LWM2M_FIRMWARE_UPDATE_PULL_SUPPORT)
 static int firmware_update_cb(uint16_t obj_inst_id)
 {
-	LOG_DBG("UPDATE");
+	struct update_counter update_counter;
+	int ret = 0;
 
-	/* TODO: kick off update process */
+	LOG_DBG("Executing firmware update");
 
-	/* If success, set the update result as RESULT_SUCCESS.
-	 * In reality, it should be set at function lwm2m_setup()
-	 */
-	lwm2m_engine_set_u8("5/0/3", STATE_IDLE);
-	lwm2m_engine_set_u8("5/0/5", RESULT_SUCCESS);
+	/* Bump update counter so it can be verified on the next reboot */
+	ret = fota_update_counter_read(&update_counter);
+	if (ret) {
+		LOG_ERR("Failed read update counter");
+		goto cleanup;
+	}
+	LOG_INF("Update Counter: current %d, update %d",
+		update_counter.current, update_counter.update);
+	ret = fota_update_counter_update(COUNTER_UPDATE,
+					  update_counter.current + 1);
+	if (ret) {
+		LOG_ERR("Failed to update the update counter: %d", ret);
+		goto cleanup;
+	}
+
+	boot_request_upgrade(false);
+
+	k_delayed_work_submit(&reboot_work, K_SECONDS(1));
+
 	return 0;
+
+cleanup:
+	return ret;
 }
 #endif
 
@@ -224,9 +275,106 @@ static int firmware_block_received_cb(uint16_t obj_inst_id,
 				      uint8_t *data, uint16_t data_len,
 				      bool last_block, size_t total_size)
 {
-	LOG_INF("FIRMWARE: BLOCK RECEIVED: len:%u last_block:%d",
-		data_len, last_block);
-	return 0;
+#if defined(CONFIG_FOTA_ERASE_PROGRESSIVELY)
+	static int last_offset = FLASH_BANK1_OFFSET;
+#endif
+	static uint8_t percent_downloaded;
+	static uint32_t bytes_downloaded;
+	uint8_t downloaded;
+	int ret = 0;
+
+	LOG_DBG("FIRMWARE: BLOCK RECEIVED: len:%u last_block:%d",
+			data_len, last_block);
+
+	if (total_size > FLASH_BANK1_SIZE) {
+		LOG_ERR("Artifact file size too big (%d)", total_size);
+		return -EINVAL;
+	}
+
+	if (!data_len) {
+		LOG_ERR("Data len is zero, nothing to write.");
+		return -EINVAL;
+	}
+
+	/* Erase bank 1 before starting the write process */
+	if (bytes_downloaded == 0) {
+		flash_img_init(&dfu_ctx);
+#if defined(CONFIG_FOTA_ERASE_PROGRESSIVELY)
+		LOG_INF("Download firmware started, erasing progressively.");
+		/* reset image data */
+		ret = boot_invalidate_slot1();
+		if (ret != 0) {
+			LOG_ERR("Failed to reset image data in bank 1");
+			goto cleanup;
+		}
+#else
+		LOG_INF("Download firmware started, erasing second bank");
+		ret = boot_erase_img_bank(FLASH_BANK1_ID);
+		if (ret != 0) {
+			LOG_ERR("Failed to erase flash bank 1");
+			goto cleanup;
+		}
+#endif
+	}
+
+	bytes_downloaded += data_len;
+
+	/* display a % downloaded, if it's different */
+	if (total_size) {
+		downloaded = bytes_downloaded * 100 / total_size;
+	} else {
+		/* Total size is empty when there is only one block */
+		downloaded = 100;
+	}
+
+	if (downloaded > percent_downloaded) {
+		percent_downloaded = downloaded;
+		LOG_INF("%d%%", percent_downloaded);
+	}
+
+#if defined(CONFIG_FOTA_ERASE_PROGRESSIVELY)
+	/* Erase the sector that's going to be written to next */
+	while (last_offset <
+			FLASH_BANK1_OFFSET + dfu_ctx.bytes_written +
+			DT_FLASH_ERASE_BLOCK_SIZE) {
+		LOG_INF("Erasing sector at offset 0x%x", last_offset);
+		flash_write_protection_set(flash_dev, false);
+		ret = flash_erase(flash_dev, last_offset,
+				DT_FLASH_ERASE_BLOCK_SIZE);
+		flash_write_protection_set(flash_dev, true);
+		last_offset += DT_FLASH_ERASE_BLOCK_SIZE;
+		if (ret) {
+			LOG_ERR("Error %d while erasing sector", ret);
+			goto cleanup;
+		}
+	}
+#endif
+
+	ret = flash_img_buffered_write(&dfu_ctx, data, data_len, last_block);
+	if (ret < 0) {
+		LOG_ERR("Failed to write flash block");
+		goto cleanup;
+	}
+
+	if (!last_block) {
+		/* Keep going */
+		return ret;
+	}
+
+	if (total_size && (bytes_downloaded != total_size)) {
+		LOG_ERR("Early last block, downloaded %d, expecting %d",
+				bytes_downloaded, total_size);
+		ret = -EIO;
+	}
+
+cleanup:
+#if defined(CONFIG_FOTA_ERASE_PROGRESSIVELY)
+	last_offset = DT_FLASH_AREA_IMAGE_1_OFFSET;
+#endif
+	bytes_downloaded = 0;
+	percent_downloaded = 0;
+
+	return ret;
 }
 #endif
 
@@ -307,6 +455,7 @@ static int lwm2m_setup(void)
 	lwm2m_engine_set_res_data("3/0/3", CLIENT_FIRMWARE_VER,
 				  sizeof(CLIENT_FIRMWARE_VER),
 				  LWM2M_RES_DATA_FLAG_RO);
+	lwm2m_engine_register_read_callback("3/0/3", firmware_read_cb);
 	lwm2m_engine_register_exec_callback("3/0/4", device_reboot_cb);
 	lwm2m_engine_register_exec_callback("3/0/5", device_factory_default_cb);
 	lwm2m_engine_set_res_data("3/0/9", &bat_level, sizeof(bat_level), 0);
@@ -367,6 +516,9 @@ static int lwm2m_setup(void)
 	lwm2m_engine_set_res_data("3340/0/5750", TIMER_NAME, sizeof(TIMER_NAME),
 				  LWM2M_RES_DATA_FLAG_RO);
 
+	/* Reboot work, used when executing update */
+	k_delayed_work_init(&reboot_work, reboot);
+
 	return 0;
 }
 
@@ -426,6 +578,118 @@ static void rd_client_event(struct lwm2m_ctx *client,
 	}
 }
 
+static void log_img_ver(void)
+{
+	struct mcuboot_img_header header;
+	struct mcuboot_img_sem_ver *ver;
+	int ret;
+
+	ret = boot_read_bank_header(FLASH_BANK0_ID, &header, sizeof(header));
+	if (ret) {
+		LOG_ERR("can't read header: %d", ret);
+		return;
+	} else if (header.mcuboot_version != 1) {
+		LOG_ERR("unsupported MCUboot version %u",
+			header.mcuboot_version);
+		return;
+	}
+
+	ver = &header.h.v1.sem_ver;
+	snprintf(firmware_version, sizeof(firmware_version),
+		 "%u.%u.%u build #%u", ver->major, ver->minor,
+		 ver->revision, ver->build_num);
+	LOG_INF("image version %s", log_strdup(firmware_version));
+}
+
+static int lwm2m_image_init(void)
+{
+	int ret = 0;
+	struct update_counter counter;
+	bool image_ok;
+
+	/*
+	 * Initialize the DFU context.
+	 */
+	flash_dev = device_get_binding(DT_CHOSEN_ZEPHYR_FLASH_CONTROLLER_LABEL);
+	if (!flash_dev) {
+		LOG_ERR("missing flash device %s",
+				DT_CHOSEN_ZEPHYR_FLASH_CONTROLLER_LABEL);
+		return -ENODEV;
+	}
+
+	log_img_ver();
+
+	/* Update boot status and update counter */
+	ret = fota_update_counter_read(&counter);
+	if (ret) {
+		LOG_ERR("Failed read update counter");
+		return ret;
+	}
+	LOG_INF("Update Counter: current %d, update %d",
+		counter.current, counter.update);
+	image_ok = boot_is_img_confirmed();
+	LOG_INF("Image is%s confirmed OK", image_ok ? "" : " not");
+	if (!image_ok) {
+		ret = boot_write_img_confirmed();
+		if (ret) {
+			LOG_ERR("Couldn't confirm this image: %d", ret);
+			return ret;
+		}
+		LOG_INF("Marked image as OK");
+#if defined(CONFIG_FOTA_ERASE_PROGRESSIVELY)
+		/* instead of erasing slot 1, reset image data */
+		ret = boot_invalidate_slot1();
+		if (ret) {
+			LOG_ERR("Flash image 1 reset: error %d", ret);
+			return ret;
+		}
+
+		LOG_DBG("Erased flash bank 1 at offset %x",
+			FLASH_BANK1_OFFSET);
+#else
+		ret = boot_erase_img_bank(FLASH_BANK1_ID);
+		if (ret) {
+			LOG_ERR("Flash bank erase at offset %x: error %d",
+				FLASH_BANK1_OFFSET, ret);
+			return ret;
+		}
+
+		LOG_DBG("Erased flash bank 1 at offset %x",
+			FLASH_BANK1_OFFSET);
+#endif
+
+		if (counter.update != -1) {
+			ret = fota_update_counter_update(COUNTER_CURRENT,
+						counter.update);
+			if (ret) {
+				LOG_ERR("Failed to update the update "
+					"counter: %d", ret);
+				return ret;
+			}
+			ret = fota_update_counter_read(&counter);
+			if (ret) {
+				LOG_ERR("Failed to read update counter: %d",
+					ret);
+				return ret;
+			}
+			LOG_INF("Update Counter updated");
+		}
+	}
+
+	/* Check if a firmware update status needs to be reported */
+	if (counter.update != -1 &&
+			counter.current == counter.update) {
+		/* Successful update */
+		LOG_INF("Firmware updated successfully");
+		lwm2m_engine_set_u8("5/0/5", RESULT_SUCCESS);
+	} else if (counter.update > counter.current) {
+		/* Failed update */
+		LOG_INF("Firmware failed to be updated");
+		lwm2m_engine_set_u8("5/0/5", RESULT_UPDATE_FAILED);
+	}
+
+	return ret;
+}
 void main(void)
 {
 	uint32_t flags = IS_ENABLED(CONFIG_LWM2M_RD_CLIENT_SUPPORT_BOOTSTRAP) ?
@@ -436,11 +700,30 @@ void main(void)
 
 	k_sem_init(&quit_lock, 0, UINT_MAX);
 
+	LOG_INF("Initializing FOTA settings\n");
+	ret = fota_settings_init();
+	if (ret) {
+		LOG_ERR("Failed to init fota settings (%d)", ret);
+		return;
+	}
+	LOG_INF("Initializing FOTA settings done");
+
+	settings_load();
+
+	LOG_INF("Initializing LWM2M Image");
+	ret = lwm2m_image_init();
+	if (ret < 0) {
+		LOG_ERR("Failed to setup image properties (%d)", ret);
+		return;
+	}
+	LOG_INF("lwm2m_image_init done");
+
 	ret = lwm2m_setup();
 	if (ret < 0) {
 		LOG_ERR("Cannot setup LWM2M fields (%d)", ret);
 		return;
 	}
+	LOG_DBG("lwm2m_setup done");
 
 	(void)memset(&client, 0x0, sizeof(client));
 #if defined(CONFIG_LWM2M_DTLS_SUPPORT)
